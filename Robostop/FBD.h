@@ -1,15 +1,4 @@
-/* Created By Yang */
-/*
-||
-|| @file 	FBD.h
-|| @version	2.0
-|| @author	Yang 
-|| @contact	2435575291@qq.com
-||
-|| @description
-|| Definitions of Function Blocks
-||
-*/
+
 
 #ifndef FBD_H_
 #define FBD_H_

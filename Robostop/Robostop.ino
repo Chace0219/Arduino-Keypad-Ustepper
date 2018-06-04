@@ -1,15 +1,25 @@
-﻿#include "LiquidCrystal_I2C.h"
+﻿
+// 
+#include "LiquidCrystal_I2C.h"
 #include "Keypad.h"
 #include "FBD.h"
 #include "FiniteStateMachine.h"
-#include "A4988.h"
+#include "nzs_controller.h"
 
-// end switch
+//// required varialbes
+const uint32_t MOVINGSPEED = 75; // move speed
+const uint32_t HOMINGSPEED = 75; // homing speed
+const double GANTRYWIDTH = 50.0F;
+const double RAILLEN = 200.0F;
+const double MMPERREV = 40.0; // mm per 360 degree
+
+							  // end switch
 const uint8_t LEFTSTOP = A0; // 
 const uint8_t RIGHTSTOP = A1;
 
-const uint8_t ROWS = 4; //four rows
-const uint8_t COLS = 4; //four columns
+// 
+const uint8_t ROWS = 4; // four rows
+const uint8_t COLS = 4; // four columns
 char keys[ROWS][COLS] = {
 	{ '1','2','3','A' },
 { '4','5','6','B' },
@@ -17,6 +27,9 @@ char keys[ROWS][COLS] = {
 { '.','0','#','D' }
 };
 
+static bool currMotorEn = true;
+
+// 
 uint8_t rowPins[ROWS] = { 37, 35, 33, 31 }; //connect to the row pinouts of the keypad
 uint8_t colPins[COLS] = { 29, 27, 25, 23 }; //connect to the column pinouts of the keypad
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
@@ -24,43 +37,40 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 // Set the LCD address to 0x27 for a 20 chars and 4 line display
 LiquidCrystal_I2C screen(0x27, 20, 4);
 
-const uint8_t DIR1 = 13;
-const uint8_t STEP1 = 12;
-const uint8_t ENA1 = 11;
-
-const uint8_t DIR2 = 6;
-const uint8_t STEP2 = 7;
-const uint8_t ENA2 = 12;
-
-const int STEPSPERREV = 200;
-A4988 stepper(STEPSPERREV, DIR1, STEP1, ENA1);
+// 
+NszCommandProc stepper;
 
 #define PLUS 0
 #define MINUS 1
 #define NONESIGN 2
 #define EMPTYROW "                    "
 
-//
+// 
 const uint8_t NORMAL = 0;
 const uint8_t STEPPING = 1;
 const uint8_t INVALID = 2;
 
-const double RAILLEN = 200.0;
-const double STEPSPERMILL = 114.29;
-const double MAXSTEP = RAILLEN * STEPSPERMILL;
+
 
 // POSITIVE - right to left
 // NEGATIVE - left to right
-#define POSITIVE 0
-#define NEGATIVE 1
-const bool HOMEDIR = POSITIVE; 
-static int32_t absStepCnt = 0;
-static double relPos = 0.0F;
+#define POSITIVE 1
+#define NEGATIVE 0
+static bool homeDir = POSITIVE;
 
 #define METRIC false
 #define IMPERAL true
-
 static bool unit = METRIC;
+
+// 
+static double absPos = 0.0F;
+static double relPos = 0.0F;
+
+static uint32_t nLastCheckPosTime;
+
+// 
+static double predictAbsPos = 0.0F;
+double getAbsolutePos();
 
 // double map function 
 float map_double(double x, double in_min, double in_max, double out_min, double out_max)
@@ -81,21 +91,13 @@ uint8_t relInputValueSign = NONESIGN;
 String relInputValueStr = "";
 void displayRelativeMode(bool init = false, uint8_t status = NORMAL);
 
-// increment mode display variables
-uint8_t nudgeValueSign = NONESIGN;
-String nudgeValueStr = "";
-void displayIncrementMode(bool init = false, uint8_t status = NORMAL);
-
 State startup(NULL);
 State absolute(NULL); // ABSOLUTE Measure Mode
 State relative(NULL); // RELATIVE Move Mode
-State increment(NULL); // Increment Move Mode
 State homing(NULL); // Homing Mode
 State nudgeAdjust(NULL); // Nudge ADJUST Mode
 FiniteStateMachine screenMachine(startup);
 
-static int32_t targetStepCnt = 0;
-static int32_t movingSteps = 0;
 void stepperIdleEnter();
 void stepperIdleUpdate();
 void stepperIdleExit();
@@ -105,13 +107,15 @@ void stepperActiveUpdate();
 void stepperActiveExit();
 State stepperActive(stepperActiveEnter, stepperActiveUpdate, stepperActiveExit);
 
+void stepperLeftEnter();
 void stepperLeftUpdate();
 void stepperLeftExit();
-State stepperToLeft(NULL, stepperLeftUpdate, stepperLeftExit);
+State stepperToLeft(stepperLeftEnter, stepperLeftUpdate, stepperLeftExit);
 
+void stepperRightEnter();
 void stepperRightUpdate();
 void stepperRightExit();
-State stepperToRight(NULL, stepperRightUpdate, stepperRightExit);
+State stepperToRight(stepperRightEnter, stepperRightUpdate, stepperRightExit);
 
 FiniteStateMachine stepperMachine(stepperIdle);
 
@@ -119,15 +123,6 @@ void initLCD()
 {
 	screen.begin();
 	screen.backlight();
-}
-
-void initMotor()
-{
-	// 6rpm
-	stepper.begin(60);
-	stepper.enable();
-	//
-	stepper.setMicrostep(16); // full microstep
 }
 
 void initPorts()
@@ -143,23 +138,48 @@ void setup()
 	Serial.println(F("program started"));
 	initPorts();
 	initLCD();
-	initMotor();
+
+	// 
+	stepper.init();
+
+
+	// 
 	keypad.setHoldTime(3000);
 	keypad.addEventListener(keypadEvent);
 	displayStartup();
-	
-	// targetStepCnt = 3000;
+
+	//
+	relPos = 0.0;
+	absPos = getAbsolutePos();
+
+	// predictAbsPos = 100;
 	// stepperMachine.transitionTo(stepperActive);
+
 }
 
-static uint32_t oldPosition = 0;
 
-TON leftStopTON(50);
+double getAbsolutePos()
+{
+	double absRad, absPos;
+	if (stepper.readPos(absRad))
+	{
+		Serial.print(F("current absolute position is "));
+		absPos = (absRad / 360) * MMPERREV;
+		Serial.print(absPos, 2);
+		Serial.println(F("mm."));
+	}
+	else
+		Serial.println(F("nano zero stepper not responding"));
+
+	return absPos;
+}
+
+TON leftStopTON(25);
 Rtrg leftStopTrg;
-TON rightStopTON(50);
+TON rightStopTON(25);
 Rtrg rightStopTrg;
 
-TON leftStopKeepTON(2000);
+TON RightStopKeepTON(2000);
 
 void loop()
 {
@@ -173,19 +193,12 @@ void loop()
 	rightStopTrg.IN = rightStopTON.IN;
 	rightStopTrg.update();
 
-	if (leftStopTrg.Q)
-		Serial.println(F("left end switch is triggered"));
-
-	if (rightStopTrg.Q)
-		Serial.println(F("right end switch is triggered"));
-
-	leftStopKeepTON.IN = digitalRead(LEFTSTOP) == false;
-	leftStopKeepTON.update();
+	RightStopKeepTON.IN = digitalRead(RIGHTSTOP) == false;
+	RightStopKeepTON.update();
 	if (screenMachine.isInState(startup))
 	{
-		if (leftStopKeepTON.Q)
+		if (rightStopTON.Q)
 		{
-			absStepCnt = MAXSTEP;
 			screenMachine.transitionTo(absolute);
 			displayAbsoluteMode(true);
 		}
@@ -209,12 +222,12 @@ void displayStartup(bool init, uint8_t mode)
 	if (mode == NORMAL)
 	{
 		screen.setCursor(0, 3);
-		screen.print(F("PRESS 4 TO HOME LEFT"));
+		screen.print(F("PRESS 6 TO HOME -> "));
 	}
 	else if (mode == STEPPING)
 	{
 		screen.setCursor(0, 3);
-		screen.print(F(" MOVING TO LEFT POS "));
+		screen.print(F(" MOVING TO HOME -> "));
 	}
 }
 
@@ -222,21 +235,33 @@ void displayAbsoluteMode(bool init, uint8_t status)
 {
 	screen.blink_off();
 	screen.setCursor(0, 0);
-	screen.print(F("MODE:ABS MEASURE MM "));
+	if (unit == METRIC)
+		screen.print(F("MODE:ABS MEASURE MM "));
+	else
+		screen.print(F("MODE:ABS MEASURE IN "));
+
 	screen.setCursor(0, 1);
 	screen.print(F("ABS POS:"));
-	
+
 	// display absolute position
 	String absPosStr = "";
-	double absPos = getAbsPos(absStepCnt, HOMEDIR);
-	if (absPos > 99.0F) {}
-	else if (absPos > 9.0F)
+	double value;
+	if (unit == METRIC)
+		value = absPos;
+	else
+		value = absPos / 2.54F;
+
+	if (value > 99.0F) {}
+	else if (value > 9.0F)
 		absPosStr += " ";
 	else
 		absPosStr += "  ";
 
-	absPosStr += String(absPos, 3);
-	absPosStr += "MM   ";
+	absPosStr += String(value, 3);
+	if (unit == METRIC)
+		absPosStr += "MM   ";
+	else
+		absPosStr += "IN   ";
 	screen.print(absPosStr);
 
 	screen.setCursor(0, 3);
@@ -261,7 +286,6 @@ void displayAbsoluteMode(bool init, uint8_t status)
 	{
 		screen.setCursor(0, 2);
 		screen.print(F("BEYOND TRAVEL LIMIT "));
-		// screen.print(F("INVALID INPUT VALUE "));
 	}
 	else if (status == STEPPING)
 	{
@@ -276,37 +300,57 @@ void displayRelativeMode(bool init, uint8_t status)
 	screen.blink_off();
 
 	screen.setCursor(0, 0);
-	screen.print(F("MODE:REL MOVE MM    "));
+	if (unit == METRIC)
+		screen.print(F("MODE:REL MOVE MM    "));
+	else
+		screen.print(F("MODE:REL MOVE INCH  "));
+
 	screen.setCursor(0, 1);
 	screen.print(F("ABS POS:  "));
 
 	// display absolute position
 	String absPosStr = "";
-	double absPos = getAbsPos(absStepCnt, HOMEDIR);
-	if (absPos > 99.0F) {}
-	else if (absPos > 9.0F)
+	double value;
+	if (unit == METRIC)
+		value = absPos;
+	else
+		value = absPos / 2.54F;
+
+	if (value > 99.0F) {}
+	else if (value > 9.0F)
 		absPosStr += " ";
 	else
 		absPosStr += "  ";
-	absPosStr += String(absPos, 2);
-	absPosStr += "MM ";
+	absPosStr += String(value, 2);
+	if (unit == METRIC)
+		absPosStr += "MM ";
+	else
+		absPosStr += "IN ";
 	screen.print(absPosStr);
 
 	String relPosStr;
 	screen.setCursor(0, 2);
 	screen.print(F("REL POS: "));
 	// relPos = 12.5;
-	if (abs(relPos) > 99.0F) {}
-	else if (abs(relPos) > 9.0F)
+	value = 0;
+	if (unit == METRIC)
+		value = relPos;
+	else
+		value = relPos / 2.54;
+
+	if (abs(value) > 99.0F) {}
+	else if (abs(value) > 9.0F)
 		relPosStr += " ";
 	else
 		relPosStr += "  ";
 	if (relPos >= 0.0)
 		relPosStr += "+";
-	relPosStr += String(relPos, 2);
-	relPosStr += "MM  ";
+	relPosStr += String(value, 2);
+	if (unit == METRIC)
+		relPosStr += "MM  ";
+	else
+		relPosStr += "INCH";
 	screen.print(relPosStr);
-
 
 	if (status == NORMAL)
 	{
@@ -337,71 +381,6 @@ void displayRelativeMode(bool init, uint8_t status)
 	}
 }
 
-void displayIncrementMode(bool init, uint8_t status)
-{
-	screen.blink_off();
-	screen.setCursor(0, 0);
-	screen.print(F("MODE:INCREM MOVE MM "));
-	screen.setCursor(0, 1);
-	screen.print(F("ABS POS: "));
-
-	// display absolute position
-	String absPosStr = " ";
-	double absPos = getAbsPos(absStepCnt, HOMEDIR);
-	if (absPos > 99.0F) {}
-	else if (absPos > 9.0F)
-		absPosStr += " ";
-	else
-		absPosStr += "  ";
-	absPosStr += String(absPos, 2);
-	absPosStr += "MM ";
-	screen.print(absPosStr);
-
-	String relPosStr = "";
-	screen.setCursor(0, 2);
-	screen.print(F("REL POS: "));
-	// relPos = 12.5;
-	if (abs(relPos) > 99.0F) {}
-	else if (abs(relPos) > 9.0F)
-		relPosStr += " ";
-	else
-		relPosStr += "  ";
-	if (relPos >= 0.0)
-		relPosStr += "+";
-	relPosStr += String(relPos, 2);
-	relPosStr += "MM  ";
-	screen.print(relPosStr);
-
-	if (init)
-	{
-		screen.setCursor(0, 3);
-		screen.print(EMPTYROW);
-	}
-
-	if (status == NORMAL)
-	{
-		screen.setCursor(0, 3);
-		screen.print(F("NUDGE:"));
-		if (nudgeValueSign == PLUS)
-			screen.print(F("+"));
-		else
-			screen.print(F("-"));
-		screen.print(nudgeValueStr);
-		screen.blink_on();
-	}
-	else if (status == INVALID)
-	{
-		screen.setCursor(0, 3);
-		screen.print(F("NUDGE: INVALID INPUT"));
-	}
-	else if (status == STEPPING)
-	{
-		screen.setCursor(0, 3);
-		screen.print(F("NUDGE:  MOVING NOW  "));
-	}
-
-}
-
 void displayHomingMode()
 {
 	screen.blink_off();
@@ -421,11 +400,57 @@ void displayNudgeMode()
 	screen.setCursor(0, 0);
 	screen.print(F("MODE:NUDGE ADJUST   "));
 	screen.setCursor(0, 1);
-	screen.print(F("#1 -0.1MM #3 +0.1MM "));
+	if (unit == METRIC)
+		screen.print(F("#1 -0.1MM #3 +0.1MM "));
+	else
+		screen.print(F("#1 -0.1IN #3 +0.1IN "));
+
 	screen.setCursor(0, 2);
-	screen.print(F("#4 -1MM   #6 +1MM   "));
+	if (unit == METRIC)
+		screen.print(F("#4 -1MM   #6 +1MM   "));
+	else
+		screen.print(F("#4 -1IN   #6 +1IN   "));
+
 	screen.setCursor(0, 3);
-	screen.print(F("#7 -10MM  #9 +10MM  "));
+	
+	//
+	double value;
+	String strLine = "";
+	strLine += "Abs:";
+	
+	//
+	if (unit == METRIC)
+		value = absPos;
+	else
+		value = absPos / 2.54F;
+
+	if (value >= 100.0F)
+		strLine += String(value, 1);
+	else if(value >= 10.0F)
+		strLine += String(value, 2);
+	else
+		strLine += String(value, 3);
+
+	strLine += " Rel:";
+	if (unit == METRIC)
+		value = relPos;
+	else
+		value = relPos / 2.54F;
+
+	if (value < 0.0)
+		strLine += "-";
+	else
+		strLine += "+";
+
+	value = abs(value);
+	if (value >= 100.0F)
+		strLine += String(value, 1);
+	else if (value >= 10.0F)
+		strLine += String(value, 2);
+	else
+		strLine += String(value, 3);
+
+	screen.print(strLine);
 }
 
 
@@ -447,16 +472,19 @@ void keypadEvent(KeypadEvent key) {
 				{
 				case '0':
 				{
-					absStepCnt = 0;
-					relPos = 0;
+					// reset all variables
+					absPos = 0.0F;
+					relPos = 0.0F;
+					stepper.setZero();
+
 					screenMachine.transitionTo(absolute);
 					displayAbsoluteMode(true);
 				}
 				break;
 
-				case '4':
+				case '6':
 				{
-					stepperMachine.transitionTo(stepperToLeft);
+					stepperMachine.transitionTo(stepperToRight);
 					displayStartup(false, STEPPING);
 				}
 				break;
@@ -480,7 +508,7 @@ void keypadEvent(KeypadEvent key) {
 				}
 
 			}
-			else if(stepperMachine.isInState(stepperActive))
+			else if (stepperMachine.isInState(stepperActive))
 			{
 				switch ((char)key)
 				{
@@ -534,20 +562,26 @@ void keypadEvent(KeypadEvent key) {
 						Serial.print(F(" "));
 					Serial.println(specifiedValue, 3);
 
-					double absPos = getAbsPos(absStepCnt, HOMEDIR);
+					if (unit != METRIC)
+						specifiedValue = specifiedValue * 2.54F;
+
+					absPos = getAbsolutePos();
+
+					double value = absPos;
 					if (absoluteMoveSign == PLUS)
-						absPos += specifiedValue;
+						value += specifiedValue;
 					else if (absoluteMoveSign == MINUS)
-						absPos -= specifiedValue;
+						value -= specifiedValue;
 					else
-						absPos = specifiedValue;
-					if (absPos >= 0.0F && absPos <= RAILLEN)
+						value = specifiedValue;
+
+					if (value >= 0.0F && value <= RAILLEN)
 					{
-						targetStepCnt = posConvStep(absPos, HOMEDIR);
-						Serial.print(F("target step count is "));
-						Serial.println(targetStepCnt);
+						Serial.print(F("target absolute position is "));
+						Serial.println(value, 2);
 						displayAbsoluteMode(false, STEPPING);
 						stepperMachine.transitionTo(stepperActive);
+						predictAbsPos = value;
 					}
 					else
 					{
@@ -603,6 +637,7 @@ void keypadEvent(KeypadEvent key) {
 				{
 				case 'C':
 				{
+					stepper.stopMove();
 					Serial.println(F("cancel button pressed on abs mode"));
 					stepperMachine.transitionTo(stepperIdle);
 				}
@@ -619,10 +654,8 @@ void keypadEvent(KeypadEvent key) {
 				{
 				case 'A':
 				{
-					screenMachine.transitionTo(increment);
-					nudgeValueSign = NONESIGN;
-					nudgeValueStr = "";
-					displayIncrementMode(true, NORMAL);
+					screenMachine.transitionTo(homing);
+					displayHomingMode();
 				}
 				break;
 
@@ -652,26 +685,40 @@ void keypadEvent(KeypadEvent key) {
 						Serial.print(F("-"));
 					else
 						Serial.print(F(" "));
-					Serial.println(specifiedValue, 3);
-
-					double absPos = getAbsPos(absStepCnt, HOMEDIR);
-					if (relInputValueSign == PLUS)
-						absPos += specifiedValue;
-					else if (relInputValueSign == MINUS)
-						absPos -= specifiedValue;
+					Serial.print(specifiedValue, 3);
+					if (unit == METRIC)
+						Serial.println(F("mm"));
 					else
-						absPos += (specifiedValue - relPos);
-							
-					if (absPos >= 0.0F && absPos <= RAILLEN)
+						Serial.println(F("inch"));
+
+					// 
+					if (unit != METRIC)
+						specifiedValue = specifiedValue * 2.54;
+
+					absPos = getAbsolutePos();
+					double value = relPos;
+					if (relInputValueSign == PLUS)
+						value += specifiedValue;
+					else if (relInputValueSign == MINUS)
+						value -= specifiedValue;
+					else
+						value = specifiedValue;
+
+					// 
+					predictAbsPos = absPos;
+					if (homeDir == POSITIVE)
+						predictAbsPos += (value - absPos);
+					else
+						predictAbsPos -= (value - absPos);
+					if (predictAbsPos >= 0.0F && predictAbsPos <= RAILLEN)
 					{
-						targetStepCnt = posConvStep(absPos, HOMEDIR);
-						Serial.print(F("target step count is "));
-						Serial.println(targetStepCnt);
+						Serial.print(F("target absolute position is "));
+						Serial.println(predictAbsPos);
 						displayRelativeMode(false, STEPPING);
 						stepperMachine.transitionTo(stepperActive);
 					}
 					else
-					{
+					{ // 
 						displayRelativeMode(false, INVALID);
 					}
 				}
@@ -733,118 +780,6 @@ void keypadEvent(KeypadEvent key) {
 			}
 
 		}
-		else if (screenMachine.isInState(increment))
-		{
-			if (stepperMachine.isInState(stepperIdle))
-			{
-				switch ((char)key)
-				{
-				case 'A':
-				{
-					screenMachine.transitionTo(homing);
-					displayHomingMode();
-				}
-				break;
-
-				case 'B':
-				{
-					if (nudgeValueSign == PLUS)
-						nudgeValueSign = MINUS;
-					else
-						nudgeValueSign = PLUS;
-					displayIncrementMode(false);
-				}
-				break;
-				case 'C':
-				{
-					nudgeValueStr = "";
-					displayIncrementMode(true);
-				}
-				break;
-
-				case 'D':
-				{
-					double specifiedValue = nudgeValueStr.toDouble();
-					Serial.print(F("entered specified value is "));
-					if (nudgeValueSign == PLUS)
-						Serial.print(F("+"));
-					else
-						Serial.print(F("-"));
-					Serial.println(specifiedValue, 3);
-
-					double currAbsPos = getAbsPos(absStepCnt, HOMEDIR);
-					if (nudgeValueSign == PLUS)
-						currAbsPos += specifiedValue;
-					else
-						currAbsPos -= specifiedValue;
-					if (currAbsPos >= 0.0F && currAbsPos <= RAILLEN)
-					{
-						targetStepCnt = posConvStep(currAbsPos, HOMEDIR);
-						Serial.print(F("target step count is "));
-						Serial.println(targetStepCnt);
-						displayIncrementMode(false, STEPPING);
-						stepperMachine.transitionTo(stepperActive);
-					}
-					else
-						displayIncrementMode(false, INVALID);
-				}
-				break;
-
-				case '0':
-				case '1':
-				case '2':
-				case '3':
-				case '4':
-				case '5':
-				case '6':
-				case '7':
-				case '8':
-				case '9':
-				{
-					if (nudgeValueStr == "0")
-						nudgeValueStr = String(key);
-					else
-						nudgeValueStr += String(key);
-					displayIncrementMode(false);
-				}
-				break;
-
-				case '.':
-				{
-					if (nudgeValueStr.length() > 0 && nudgeValueStr.indexOf(".") == -1)
-					{
-						nudgeValueStr += String(key);
-						displayIncrementMode(false);
-					}
-				}
-				break;
-
-				case '#':
-				{
-					Serial.println(F("entered into nudge mode"));
-					displayNudgeMode();
-					screenMachine.transitionTo(nudgeAdjust);
-				}
-				break;
-
-				default:
-					break;
-				}
-			}
-			else if (stepperMachine.isInState(stepperActive))
-			{
-				switch ((char)key)
-				{
-				case 'C':
-				{
-					Serial.println(F("cancel button pressed on increment mode"));
-					stepperMachine.transitionTo(stepperIdle);
-				}
-				break;
-				}
-			}
-
-		}
 		else if (screenMachine.isInState(homing))
 		{
 			if (stepperMachine.isInState(stepperIdle))
@@ -853,6 +788,8 @@ void keypadEvent(KeypadEvent key) {
 				{
 				case 'A':
 				{
+					stepper.enablePinMode(true);
+					syncRelPos();
 					screenMachine.transitionTo(absolute);
 					displayAbsoluteMode(true);
 				}
@@ -860,6 +797,8 @@ void keypadEvent(KeypadEvent key) {
 
 				case '4':
 				{
+					stepper.enablePinMode(true);
+					syncRelPos();
 					Serial.println(F("it will go to left end"));
 					stepperMachine.transitionTo(stepperToLeft);
 				}
@@ -867,30 +806,36 @@ void keypadEvent(KeypadEvent key) {
 
 				case '5':
 				{
+					stepper.enablePinMode(true);
+					syncRelPos();
 					Serial.println(F("it will go to center positon"));
-					targetStepCnt = MAXSTEP / 2;
+					predictAbsPos = RAILLEN / 2;
 					stepperMachine.transitionTo(stepperActive);
 				}
 				break;
 
 				case '6':
 				{
+					stepper.enablePinMode(true);
 					Serial.println(F("it will go to right end"));
+					syncRelPos();
 					stepperMachine.transitionTo(stepperToRight);
 				}
 				break;
 
 				case '#':
 				{
+					stepper.enablePinMode(true);
 					Serial.println(F("entered into nudge mode"));
+					syncRelPos();
 					displayNudgeMode();
 					screenMachine.transitionTo(nudgeAdjust);
 				}
 				break;
 				case 'C':
 				{
-					Serial.println(F("cancel button pressed on homing mode"));
-					stepperMachine.transitionTo(stepperIdle);
+					Serial.println(F("disabled motor on homing mode"));
+					stepper.enablePinMode(false);
 				}
 				break;
 				}
@@ -928,13 +873,13 @@ void keypadEvent(KeypadEvent key) {
 					double specifiedValue = -0.1;
 					Serial.print(F("nudge mode entered specified value is "));
 					Serial.println(F("-0.1mm"));
-					double currAbsPos = getAbsPos(absStepCnt, HOMEDIR);
-					currAbsPos += specifiedValue;
-					if (currAbsPos >= 0.0F && currAbsPos <= RAILLEN)
+					double value = getAbsolutePos();
+					value += specifiedValue;
+					if (value >= 0.0F && value <= RAILLEN)
 					{
-						targetStepCnt = posConvStep(currAbsPos, HOMEDIR);
+						predictAbsPos = value;
 						Serial.print(F("target step count is "));
-						Serial.println(targetStepCnt);
+						Serial.println(predictAbsPos);
 						stepperMachine.transitionTo(stepperActive);
 					}
 				}
@@ -944,13 +889,13 @@ void keypadEvent(KeypadEvent key) {
 					double specifiedValue = -1.0;
 					Serial.print(F("nudge mode entered specified value is "));
 					Serial.println(F("-1.0mm"));
-					double currAbsPos = getAbsPos(absStepCnt, HOMEDIR);
-					currAbsPos += specifiedValue;
-					if (currAbsPos >= 0.0F && currAbsPos <= RAILLEN)
+					double value = getAbsolutePos();
+					value += specifiedValue;
+					if (value >= 0.0F && value <= RAILLEN)
 					{
-						targetStepCnt = posConvStep(currAbsPos, HOMEDIR);
 						Serial.print(F("target step count is "));
-						Serial.println(targetStepCnt);
+						Serial.println(value);
+						predictAbsPos = value;
 						stepperMachine.transitionTo(stepperActive);
 					}
 				}
@@ -961,13 +906,13 @@ void keypadEvent(KeypadEvent key) {
 					double specifiedValue = -10.0;
 					Serial.print(F("nudge mode entered specified value is "));
 					Serial.println(F("-10.0mm"));
-					double currAbsPos = getAbsPos(absStepCnt, HOMEDIR);
-					currAbsPos += specifiedValue;
-					if (currAbsPos >= 0.0F && currAbsPos <= RAILLEN)
+					double value = getAbsolutePos();
+					value += specifiedValue;
+					if (value >= 0.0F && value <= RAILLEN)
 					{
-						targetStepCnt = posConvStep(currAbsPos, HOMEDIR);
 						Serial.print(F("target step count is "));
-						Serial.println(targetStepCnt);
+						Serial.println(value);
+						predictAbsPos = value;
 						stepperMachine.transitionTo(stepperActive);
 					}
 				}
@@ -978,13 +923,13 @@ void keypadEvent(KeypadEvent key) {
 					double specifiedValue = 0.1;
 					Serial.print(F("nudge mode entered specified value is "));
 					Serial.println(F("+0.1mm"));
-					double currAbsPos = getAbsPos(absStepCnt, HOMEDIR);
-					currAbsPos += specifiedValue;
-					if (currAbsPos >= 0.0F && currAbsPos <= RAILLEN)
+					double value = getAbsolutePos();
+					value += specifiedValue;
+					if (value >= 0.0F && value <= RAILLEN)
 					{
-						targetStepCnt = posConvStep(currAbsPos, HOMEDIR);
 						Serial.print(F("target step count is "));
-						Serial.println(targetStepCnt);
+						Serial.println(value);
+						predictAbsPos = value;
 						stepperMachine.transitionTo(stepperActive);
 					}
 				}
@@ -995,13 +940,13 @@ void keypadEvent(KeypadEvent key) {
 					double specifiedValue = 1.0;
 					Serial.print(F("nudge mode entered specified value is "));
 					Serial.println(F("+1.0mm"));
-					double currAbsPos = getAbsPos(absStepCnt, HOMEDIR);
-					currAbsPos += specifiedValue;
-					if (currAbsPos >= 0.0F && currAbsPos <= RAILLEN)
+					double value = getAbsolutePos();
+					value += specifiedValue;
+					if (value >= 0.0F && value <= RAILLEN)
 					{
-						targetStepCnt = posConvStep(currAbsPos, HOMEDIR);
 						Serial.print(F("target step count is "));
-						Serial.println(targetStepCnt);
+						Serial.println(value);
+						predictAbsPos = value;
 						stepperMachine.transitionTo(stepperActive);
 					}
 				}
@@ -1012,13 +957,13 @@ void keypadEvent(KeypadEvent key) {
 					double specifiedValue = 10.0;
 					Serial.print(F("nudge mode entered specified value is "));
 					Serial.println(F("+10.0mm"));
-					double currAbsPos = getAbsPos(absStepCnt, HOMEDIR);
-					currAbsPos += specifiedValue;
-					if (currAbsPos >= 0.0F && currAbsPos <= RAILLEN)
+					double value = getAbsolutePos();
+					value += specifiedValue;
+					if (value >= 0.0F && value <= RAILLEN)
 					{
-						targetStepCnt = posConvStep(currAbsPos, HOMEDIR);
 						Serial.print(F("target step count is "));
-						Serial.println(targetStepCnt);
+						Serial.println(value);
+						predictAbsPos = value;
 						stepperMachine.transitionTo(stepperActive);
 					}
 				}
@@ -1035,219 +980,185 @@ void keypadEvent(KeypadEvent key) {
 		Serial.println((char)key);
 		if (stepperMachine.isInState(stepperIdle))
 		{
-			if (screenMachine.isInState(relative))
+			if ((char)key == '0')
 			{
-				switch ((char)key)
-				{
-				case '#':
+				if (screenMachine.isInState(relative))
 				{
 					Serial.println(F("resetting relative position in relative mode"));
 					relPos = 0.0F;
 					displayRelativeMode(NORMAL);
-					// displayRelativeMode(true, NORMAL);
-				}
-				break;
 				}
 			}
-			else
+			else if ((char)key == '-' || (char)key == '+')
 			{
-				switch ((char)key)
-				{
-				case '#':
-				{
-					Serial.println(F("resetting relative position in increment mode"));
-					relPos = 0.0F;
+				Serial.println(F("display unit will be switched"));
+				if (unit == METRIC)
+					unit = IMPERAL;
+				else
+					unit = METRIC;
+				if (screenMachine.isInState(startup))
+					displayStartup();
+				else if (screenMachine.isInState(absolute))
+					displayAbsoluteMode(true, NORMAL);
+				else if (screenMachine.isInState(relative))
 					displayRelativeMode(true, NORMAL);
-					screenMachine.transitionTo(relative);
-					// displayRelativeMode(NORMAL);
-				}
-				break;
-				}
-
+				else if (screenMachine.isInState(nudgeAdjust))
+					displayNudgeMode();
 			}
 		}
+
+
 	}
 	break;
 	}  // end switch-case
 }
 
 
-void stepperIdleEnter() {}
+void stepperIdleEnter()
+{
+	stepper.stopMove();
+}
+
 void stepperIdleUpdate() {}
 void stepperIdleExit() {}
-void stepperActiveEnter() 
+void stepperActiveEnter()
 {
-	const int32_t MAXINTERVAL = 100;
-	if (abs(targetStepCnt - absStepCnt) > MAXINTERVAL)
-	{
-		if (targetStepCnt - absStepCnt > MAXINTERVAL)
-			movingSteps = MAXINTERVAL;
-		else
-			movingSteps = -MAXINTERVAL;
-	}
-	else
-		movingSteps = targetStepCnt - absStepCnt;
-
-	Serial.print(F("moving steps "));
-	Serial.println(movingSteps);
-	stepper.move(movingSteps);
-	moveRelPos(movingSteps, HOMEDIR);
-	absStepCnt += movingSteps;
-
-	Serial.print(F("rel pos is "));
-	Serial.print(relPos, 3);
-	Serial.print(F(", absStepCnt "));
-	Serial.println(absStepCnt);
+	nLastCheckPosTime = millis();
+	double targetRad = (predictAbsPos / MMPERREV) * 360.0F;
+	stepper.moveToPosition(targetRad, MOVINGSPEED);
 }
 
 static uint32_t lastSteppingTime = millis();
 
 void stepperActiveUpdate()
 {
-
-	if (rightStopTON.Q && movingSteps < 0)
+	// 
+	if (predictAbsPos > absPos)
 	{
-		Serial.println(F("right stop switch is triggered"));
-		absStepCnt = 0;
-		stepperMachine.transitionTo(stepperIdle);
-	}
-	if (leftStopTON.Q && movingSteps > 0)
-	{
-		Serial.println(F("left stop switch is triggered"));
-		absStepCnt = MAXSTEP;
-		stepperMachine.transitionTo(stepperIdle);
-	}
-
-	if (stepperMachine.timeInCurrentState() > abs(movingSteps) / 5)
-	{
-		if (targetStepCnt == absStepCnt)
-			stepperMachine.transitionTo(stepperIdle);
-		else
+		if (leftStopTON.Q)
 		{
-			if (targetStepCnt != absStepCnt)
-				stepperMachine.immediateTransitionTo(stepperActive);
+			Serial.println(F("left stop switch is triggered"));
+			stepper.stopMove();
+
+			delay(500);
+			stepperMachine.transitionTo(stepperIdle);
+		}
+	}
+	else
+	{
+		if (rightStopTON.Q)
+		{
+			stepper.stopMove();
+			delay(500);
+			Serial.println(F("right stop switch is triggered"));
+
+			stepper.setZero();
+			stepperMachine.transitionTo(stepperIdle);
+		}
+	}
+
+	// 
+	if (stepperMachine.timeInCurrentState() > 10000)
+	{
+		stepperMachine.transitionTo(stepperIdle);
+	}
+	else
+	{
+		if (millis() - nLastCheckPosTime > 250)
+		{
+			nLastCheckPosTime = millis();
+			double value = getAbsolutePos();
+			if (abs(predictAbsPos - value) < 1.0)
+				stepperMachine.transitionTo(stepperIdle);
+			else
+			{
+				syncRelPos();
+
+				if (screenMachine.isInState(absolute))
+					displayAbsoluteMode(false, STEPPING);
+				else if (screenMachine.isInState(relative))
+					displayRelativeMode(false, STEPPING);
+				else if (screenMachine.isInState(nudgeAdjust))
+					displayNudgeMode();
+			}
 		}
 	}
 }
 
 void stepperActiveExit()
 {
+	syncRelPos();
+
 	if (screenMachine.isInState(startup))
 		displayStartup();
 	else if (screenMachine.isInState(absolute))
 		displayAbsoluteMode(true, NORMAL);
 	else if (screenMachine.isInState(relative))
 		displayRelativeMode(true, NORMAL);
-	else if (screenMachine.isInState(increment))
-		displayIncrementMode(true, NORMAL);
+	else if (screenMachine.isInState(nudgeAdjust))
+		displayNudgeMode();
+}
+
+void syncRelPos()
+{
+	double value = getAbsolutePos();
+	if (homeDir == POSITIVE)
+		relPos += (value - absPos);
+	else
+		relPos -= (value - absPos);
+	absPos = value;
+}
+
+void stepperLeftEnter()
+{
+	stepper.moveToPosition((RAILLEN / MMPERREV) * 360, HOMINGSPEED);
 }
 
 void stepperLeftUpdate()
 {
-	const uint32_t movingStep = 100;
-	if ((millis() - lastSteppingTime) > movingStep / 5)
+	if (leftStopTON.Q || leftStopTrg.Q)
 	{
-		stepper.move(movingStep); // adjust this value 
-		absStepCnt += movingStep;
+		Serial.println(F("left end switch detected"));
+		Serial.println(F("entered into idle status"));
+		stepperMachine.transitionTo(stepperIdle);
+		stepper.stopMove();
 
-		if (HOMEDIR == POSITIVE)
-		{
-			relPos += (double)movingStep / STEPSPERMILL;
-		}
-		else
-		{
-			relPos -= (double)movingStep / STEPSPERMILL;
-		}
-		Serial.print(absStepCnt);
-		Serial.print(F(", "));
-		Serial.print(relPos, 3);
-		Serial.println();
-
-		if (leftStopTON.Q)
-		{
-			Serial.println(F("left end switch detected"));
-			absStepCnt = MAXSTEP;
-			Serial.println(F("entered into idle status"));
-			stepperMachine.transitionTo(stepperIdle);
-		}
-		lastSteppingTime = millis();
+		absPos = getAbsolutePos();
+		delay(500);
 	}
 }
 
 void stepperLeftExit()
 {
+	stepper.stopMove();
+	delay(500);
+	syncRelPos();
+}
 
+void stepperRightEnter()
+{
+	
+	stepper.moveToPosition((RAILLEN / MMPERREV) * (-360.0), HOMINGSPEED);
 }
 
 void stepperRightUpdate()
 {
-	const uint32_t movingStep = 100;
-	if ((millis() - lastSteppingTime) > movingStep / 5)
+	if (rightStopTON.Q || rightStopTrg.Q)
 	{
-		stepper.move(-movingStep); // adjust this value 
-		absStepCnt -= movingStep;
-
-		if (HOMEDIR == POSITIVE)
-		{
-			relPos -= (double)movingStep / STEPSPERMILL;
-		}
-		else
-		{
-			relPos += (double)movingStep / STEPSPERMILL;
-		}
-		Serial.print(absStepCnt);
-		Serial.print(F(", "));
-		Serial.print(relPos, 3);
-		Serial.println();
-
-		if (rightStopTON.Q)
-		{
-			Serial.println(F("right end switch is detected"));
-			absStepCnt = 0;
-			Serial.println(F("entered into idle status"));
-			stepperMachine.transitionTo(stepperIdle);
-		}
-		lastSteppingTime = millis();
+		Serial.println(F("right end switch detected"));
+		Serial.println(F("entered into idle status"));
+		stepperMachine.transitionTo(stepperIdle);
+		stepper.stopMove();
+		delay(500);
+		stepper.setZero();
+		absPos = getAbsolutePos();
 	}
 }
 
 void stepperRightExit()
 {
-
+	stepper.stopMove();
+	delay(500);
+	syncRelPos();
 }
 
-void moveRelPos(int32_t movingSteps, bool direction)
-{
-	if (direction == POSITIVE)
-		relPos += movingSteps / STEPSPERMILL;
-	else
-		relPos -= movingSteps / STEPSPERMILL;
-}
-
-double getAbsPos(uint32_t absSteps, bool direction)
-{
-	double absPos;
-	if (direction == POSITIVE)
-	{
-		absPos = map_double(absStepCnt, 0, MAXSTEP, 0.0, RAILLEN);
-	}
-	else
-	{
-		absPos = map_double(absStepCnt, 0, MAXSTEP, RAILLEN, 0.0);
-	}
-	return absPos;
-}
-
-uint32_t posConvStep(double absPos, bool direction)
-{
-	uint32_t stepCount;
-	if (direction == POSITIVE)
-	{
-		stepCount = (uint32_t)map_double(absPos, 0.0, RAILLEN, 0.0, MAXSTEP);
-	}
-	else
-	{
-		stepCount = (uint32_t)map_double(absPos, 0.0, RAILLEN, MAXSTEP, 0.0);
-	}
-	return stepCount;
-}
