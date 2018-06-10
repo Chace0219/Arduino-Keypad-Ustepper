@@ -17,6 +17,7 @@ const uint8_t VELOCITYPID = 4;
 
 const char PROMPT[] = ":>";
 
+#define DEBUGOUTPUT
 class NszCommandProc
 {
 public:
@@ -32,6 +33,10 @@ public:
 	void setPos(double position);
 	void setZero();
 	void enablePinMode(bool enable);
+	void calibrate();
+	void setMaxCurrent(uint32_t value);
+	void setHoldCurrent(uint32_t value);
+	void setStepsPerRotation(uint32_t value);
 private:
 
 };

@@ -11,15 +11,50 @@ NszCommandProc::NszCommandProc()
 void NszCommandProc::init()
 {
 	COMMPORT.begin(NSZBAUDRATE);
+
 }
 
 void NszCommandProc::setCtrlMode(uint8_t mode)
 {
 	String commandStr = "ctrlmode ";
 	commandStr += String(mode);
-	// 
-	// COMMPORT.println(PROMPT);
-	// 
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
+
+	COMMPORT.println(commandStr);
+}
+
+void NszCommandProc::setMaxCurrent(uint32_t value)
+{
+	String commandStr = "maxcurrent ";
+	commandStr += String(value);
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
+
+	COMMPORT.println(commandStr);
+}
+
+void NszCommandProc::setHoldCurrent(uint32_t value)
+{
+	String commandStr = "holdcurrent ";
+	commandStr += String(value);
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
+
+	COMMPORT.println(commandStr);
+}
+
+void NszCommandProc::setStepsPerRotation(uint32_t value)
+{
+	String commandStr = "stepsperrotation ";
+	commandStr += String(value);
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
+
 	COMMPORT.println(commandStr);
 }
 
@@ -29,7 +64,10 @@ void NszCommandProc::moveToPosition(double angle, int32_t speed)
 	commandStr += String(angle, 2);
 	commandStr += " ";
 	commandStr += String(speed);
-	// Serial.println(commandStr);
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
+
 	COMMPORT.println(commandStr);
 }
 
@@ -39,17 +77,22 @@ void NszCommandProc::moveSteps(uint8_t direction, int32_t stepCnt)
 	commandStr += String(direction);
 	commandStr += " ";
 	commandStr += String(stepCnt);
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
 
-	// Serial.println(commandStr);
 	COMMPORT.println(commandStr);
 }
 
 bool NszCommandProc::readPos(double &currPos)
 {
+
+	while (COMMPORT.available())
+	{
+		char ch = COMMPORT.read();
+	}
+
 	String commandStr = "readpos";
-	// 
-	// COMMPORT.println(PROMPT);
-	// 
 	COMMPORT.println(commandStr);
 	uint32_t lastRespTime = millis();
 	bool bReceiving = false;
@@ -64,6 +107,7 @@ bool NszCommandProc::readPos(double &currPos)
 			bReceiving = true;
 			lastRespTime = millis();
 			char ch = COMMPORT.read();
+			Serial.print(ch);
 			response += String(ch);
 		}
 		if (bReceiving)
@@ -109,6 +153,9 @@ bool NszCommandProc::readPos(double &currPos)
 bool NszCommandProc::setMicroStep(uint8_t steps)
 {
 	String commandStr = "microsteps " +  String(steps);
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
 	COMMPORT.println(commandStr);
 }
 
@@ -116,6 +163,9 @@ bool NszCommandProc::setMicroStep(uint8_t steps)
 void NszCommandProc::stopMove()
 {
 	String commandStr = "stop";
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
 	COMMPORT.println(commandStr);
 
 }
@@ -124,6 +174,9 @@ void NszCommandProc::setPos(double position)
 {
 	String commandStr = "setpos ";
 	commandStr += String(position, 2);
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
 	COMMPORT.println(commandStr);
 }
 
@@ -134,11 +187,26 @@ void NszCommandProc::enablePinMode(bool enable)
 		commandStr += "0";
 	else
 		commandStr += "1";
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
 	COMMPORT.println(commandStr);
 }
 
 void NszCommandProc::setZero()
 {
 	String commandStr = "setzero";
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
+	COMMPORT.println(commandStr);
+}
+
+void NszCommandProc::calibrate()
+{
+	String commandStr = "calibrate";
+#ifdef DEBUGOUTPUT
+	Serial.println(commandStr);
+#endif // DEBUGOUTPUT
 	COMMPORT.println(commandStr);
 }
