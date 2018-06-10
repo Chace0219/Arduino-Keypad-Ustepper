@@ -9,7 +9,7 @@
 #include "nzs_controller.h"
 
 // ID of the settings block
-#define CONFIG_VERSION "ls8"
+#define CONFIG_VERSION "ls9"
 #define CONFIG_START 32
 
 // Example settings structure
@@ -27,7 +27,7 @@ struct StoreStruct {
 #define INVALIDPOS 0xFFFFFFFF
 //// required varialbes
 const uint32_t MOVINGSPEED = 150; // move speed
-const uint32_t HOMINGSPEED = 100; // homing speed
+const uint32_t HOMINGSPEED = 70; // homing speed
 const double GANTRYWIDTH = 49.94F;
 const double RAILLEN = 250.0F; // correct?
 const double RIGTHOFFSET = 1.65F; // 
@@ -51,7 +51,7 @@ char keys[ROWS][COLS] = {
 	{ '1','2','3','A' },
 { '4','5','6','B' },
 { '7','8','9','C' },
-{ '.','0','#','D' }
+{ '*','0','#','D' }
 };
 
 static bool currMotorEn = true;
@@ -120,8 +120,6 @@ String relInputValueStr = "";
 void displayRelativeMode(bool init = false, uint8_t status = NORMAL);
 
 String calInputValue = "";
-void cal1Update();
-void cal1Enter();
 
 State startup(NULL);
 State absolute(NULL); // ABSOLUTE Measure Mode
@@ -129,7 +127,8 @@ State relative(NULL); // RELATIVE Move Mode
 State homing(NULL); // Homing Mode
 State nudgeAdjust(NULL); // Nudge ADJUST Mode
 
-State ca1Step(cal1Enter, cal1Update, NULL); // 
+//
+State ca1Step(NULL); // 
 State ca2Step(NULL); // 
 State ca3Step(NULL); // 
 State ca4Step(NULL); // 
@@ -187,27 +186,45 @@ void setup()
 	initPorts();
 	initLCD();
 
+	displayStartup(true);
 	// 
 	stepper.init();
+	
+	double temp;
+	uint8_t failedCnt = 0;
+	while (!stepper.readPos(temp))
+	{
+		failedCnt++;
+		delay(1000);
+		if (failedCnt > 10)
+		{
+			displayStartup(false, INVALID);
+			while (true);
+		}
+	}
 
 	stepper.setCtrlMode(CTRLMODE);
+	delay(200);
 	stepper.setMaxCurrent(MAXCURR);
+	delay(200);
 	stepper.setHoldCurrent(HOLDCURR);
+	delay(200);
 	// stepper.setMicroStep(MICROSTEPS);
+	// delay(200);
 	stepper.setStepsPerRotation(STEPSROTATION);
+	delay(200);
 
 	// 
 	keypad.setHoldTime(3000);
 	keypad.addEventListener(keypadEvent);
-	displayStartup();
-
+	
 	syncRelPos();
-
 	loadConfig();
 
 	Serial.print(F("current mm per rev is "));
 	Serial.println(setting.mmPerRev, 2);
-	// stepperMachine.transitionTo(calibrate);
+	displayStartup();
+
 }
 
 
@@ -224,7 +241,6 @@ double getAbsolutePos()
 	}
 	else
 		Serial.println(F("nano zero stepper not responding"));
-
 	return absPos;
 }
 
@@ -253,6 +269,7 @@ void loop()
 	{
 		if (RightStopKeepTON.Q)
 		{
+			setAdjustPos(0.0F);
 			screenMachine.transitionTo(absolute);
 			displayAbsoluteMode(true);
 		}
@@ -272,8 +289,13 @@ void displayStartup(bool init, uint8_t mode)
 	screen.print(F("     VERSION 1.0    "));
 	screen.setCursor(0, 2);
 	screen.print(F("          "));
-
-	if (mode == NORMAL)
+	
+	if (init)
+	{
+		screen.setCursor(0, 3);
+		screen.print(F(" CHECKING SERVO COM"));
+	}
+	else if (mode == NORMAL)
 	{
 		screen.setCursor(0, 3);
 		screen.print(F("PRESS 6 TO HOME -> "));
@@ -282,6 +304,11 @@ void displayStartup(bool init, uint8_t mode)
 	{
 		screen.setCursor(0, 3);
 		screen.print(F(" MOVING TO HOME -> "));
+	}
+	else if (mode == INVALID)
+	{
+		screen.setCursor(0, 3);
+		screen.print(F(" PLEASE RESET POWER"));
 	}
 }
 
@@ -303,14 +330,14 @@ void displayCal1Step()
 
 	if (setting.mmPerRev < 10.0F)
 		tempStr += " ";
-	tempStr += String(setting.mmPerRev, 3);
-	tempStr += "MM    ";
+	tempStr += String(setting.mmPerRev * 2.5, 2);
+	tempStr += "MM     ";
 	screen.print(tempStr);
 
 	screen.setCursor(0, 2);
 	screen.print(F("PRESS ENTER TO HOME "));
 
-	screen.setCursor(0, 4);
+	screen.setCursor(0, 3);
 	screen.print(F("AND MOVE TO +5MM    "));
 }
 
@@ -359,9 +386,10 @@ void displayCal3Step(bool init, bool invalid)
 	screen.setCursor(0, 2);
 	screen.print("ENTER AMOUNT:");
 	screen.print(calInputValue);
+	screen.blink_on();
 }
 
-void displayCal4Step()
+void displayCal4Step(bool saved)
 {
 	screen.blink_off();
 	screen.setCursor(0, 0);
@@ -369,19 +397,21 @@ void displayCal4Step()
 
 	String tempStr = "";
 	screen.setCursor(0, 1);
-	screen.print(F("OLD AMOUNT:"));
-	if (setting.mmPerRev > 10.0F)
-		tempStr += " ";
-	tempStr += String(setting.mmPerRev, 3);
-	screen.print(tempStr);
+	screen.print(F("OLD AMOUNT: "));
+	screen.print(setting.mmPerRev * 2.5, 2);
+	screen.print("MM");
 
-	screen.setCursor(0, 1);
-	screen.print(F("NEW AMOUNT:"));
-	tempStr += String(setting.mmPerRev, 3);
-	screen.print(calInputValue);
+	double inputValue = calInputValue.toDouble();
+	screen.setCursor(0, 2);
+	screen.print(F("NEW AMOUNT: "));
+	screen.print(inputValue, 2);
+	screen.print("MM");
 
 	screen.setCursor(0, 3);
-	screen.print(F("HIT ENTER TO FINISH "));
+	if(saved)
+		screen.print(F("  CALIBRATION SAVED "));
+	else
+		screen.print(F("HIT ENTER TO FINISH "));
 }
 
 void displayAbsoluteMode(bool init, uint8_t status)
@@ -533,8 +563,13 @@ void displayRelativeMode(bool init, uint8_t status)
 		relPosStr += String(value, 3);
 		relPosStr += "IN  ";
 	}
-
 	screen.print(relPosStr);
+
+
+	Serial.print(F("abs:"));
+	Serial.print(absPos, 2);
+	Serial.print(F(", rel:"));
+	Serial.println(relPos, 2);
 
 	if (status == NORMAL)
 	{
@@ -1005,6 +1040,7 @@ void keypadEvent(KeypadEvent key) {
 					stepper.enablePinMode(true);
 					syncRelPos();
 					screenMachine.transitionTo(ca1Step);
+					displayCal1Step();
 				}
 				break;
 
@@ -1045,12 +1081,14 @@ void keypadEvent(KeypadEvent key) {
 					screenMachine.transitionTo(nudgeAdjust);
 				}
 				break;
+
 				case 'C':
 				{
 					Serial.println(F("disabled motor on homing mode"));
 					stepper.enablePinMode(false);
 				}
 				break;
+
 				}
 			}
 			else
@@ -1109,7 +1147,7 @@ void keypadEvent(KeypadEvent key) {
 				{
 				case 'D':
 				{
-					Serial.println(F("it will move 360 degree to left"));
+					Serial.println(F("it will move 100mm to left"));
 					stepperMachine.transitionTo(stepperCal40mm);
 				}
 				break;
@@ -1175,11 +1213,11 @@ void keypadEvent(KeypadEvent key) {
 					double specifiedValue = calInputValue.toDouble();
 					Serial.print(F("entered new calibration value is "));
 					Serial.println(calInputValue);
-					if (specifiedValue >= 0.0F && specifiedValue <= 99.99)
+					if (specifiedValue >= 0.0F && specifiedValue <= 999)
 					{
 						Serial.println(F("entered into calibration 4 step"));
 						screenMachine.transitionTo(ca4Step);
-						displayCal4Step();
+						displayCal4Step(false);
 					}
 					else
 					{
@@ -1196,9 +1234,21 @@ void keypadEvent(KeypadEvent key) {
 			{
 			case 'D':
 			{
-				Serial.println(F("saved setting in EEPROM"));
-				setting.mmPerRev = calInputValue.toDouble();
-				saveConfig();
+				double inputValue = calInputValue.toDouble();
+				double rad = 0.0;
+				if (stepper.readPos(rad))
+				{
+					setting.mmPerRev = inputValue / rad * 360.0F;
+					Serial.print(F("new calibration setting is "));
+					Serial.println(setting.mmPerRev, 2);
+					Serial.println(F("saved setting in EEPROM"));
+					saveConfig();
+					displayCal4Step(true);
+					delay(1000);
+					syncRelPos();
+					screenMachine.transitionTo(absolute);
+					displayAbsoluteMode(true);
+				}
 			}
 			break;
 
@@ -1413,7 +1463,6 @@ void stepperActiveUpdate()
 			}
 			else
 			{
-
 				if (screenMachine.isInState(absolute))
 					displayAbsoluteMode(false, STEPPING);
 				else if (screenMachine.isInState(relative))
@@ -1449,17 +1498,18 @@ void setAdjustPos(double predictedPos)
 	absPos = value;
 }
 
-
 void syncRelPos()
 {
 	double value = getAbsolutePos();
-	if (value == INVALIDPOS)
-		value = getAbsolutePos();
 	if (homeDir == POSITIVE)
 		relPos += (value - absPos);
 	else
 		relPos -= (value - absPos);
 	absPos = value;
+	Serial.print(F("sync position abs:"));
+	Serial.print(absPos, 2);
+	Serial.print(F(", relpos:"));
+	Serial.println(relPos, 2);
 }
 
 void stepperLeftEnter()
@@ -1503,6 +1553,7 @@ void stepperRightUpdate()
 		delay(500);
 		stepper.setZero();
 		setAdjustPos(0);
+		stepper.setZero();
 		if (screenMachine.isInState(ca1Step))
 			stepperMachine.transitionTo(stepperCal5mm);
 		else
@@ -1530,19 +1581,10 @@ void saveConfig() {
 		EEPROM.write(CONFIG_START + t, *((char*)&setting + t));
 }
 
-void cal1Update()
-{
-
-}
-
-void cal1Enter()
-{
-	displayCal1Step();
-}
-
 void cal5mmEnter()
 {
-	stepper.moveToPosition((cal5mmTarget / setting.mmPerRev) * 360.0F, MOVINGSPEED);
+	double targetRad = (cal5mmTarget / setting.mmPerRev) * 360.0F;
+	stepper.moveToPosition(targetRad, MOVINGSPEED);
 	nLastCheckPosTime = millis();
 }
 
@@ -1551,25 +1593,36 @@ void cal5mmUpdate()
 	if (millis() - nLastCheckPosTime > 250)
 	{
 		nLastCheckPosTime = millis();
-		getAbsolutePos();
-		if (abs(cal5mmTarget - absPos) < 0.1)
+		absPos = getAbsolutePos();
+
+		Serial.print(F("current abs position is "));
+		Serial.println(absPos, 2);
+
+		if (abs(cal5mmTarget - absPos) <= 0.1)
 		{
 			stepperMachine.transitionTo(stepperIdle);
 		}
+	}
+	else if (stepperMachine.timeInCurrentState() > 10000)
+	{
+		absPos = getAbsolutePos();
+		stepperMachine.transitionTo(stepperIdle);
 	}
 }
 
 void cal5mmExit()
 {
-	// stepper.setZero();
-	getAbsolutePos();
+	stepper.setZero();
+	absPos = getAbsolutePos();
 	screenMachine.transitionTo(ca2Step);
 	displayCal2Step(false);
 }
 
 void calRevoEnter()
 {
-	stepper.moveToPosition(360.0F, MOVINGSPEED);
+	double targetRad = (100.0F / setting.mmPerRev) * 360.0F;
+	stepper.moveToPosition(targetRad, MOVINGSPEED);
+	// stepper.moveToPosition(360.0F, MOVINGSPEED);
 	nLastCheckPosTime = millis();
 	displayCal2Step(true);
 }
@@ -1580,12 +1633,18 @@ void calRevoUpdate()
 	{
 		nLastCheckPosTime = millis();
 		double absRad;
-		absPos = INVALIDPOS;
 		if (!stepper.readPos(absRad))
 			Serial.println(F("nano zero stepper not responding"));
 		else
 		{
-			if (abs(absPos - 360.0F) < 0.1)
+			double targetRad = (100.0F / setting.mmPerRev) * 360.0F;
+			if (abs(absRad - targetRad) < 0.1)
+			{
+				stepperMachine.transitionTo(stepperIdle);
+				screenMachine.transitionTo(ca3Step);
+				displayCal3Step(true, false);
+			}
+			else if (stepperMachine.timeInCurrentState() > 10000)
 			{
 				stepperMachine.transitionTo(stepperIdle);
 				screenMachine.transitionTo(ca3Step);
