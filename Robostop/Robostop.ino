@@ -133,6 +133,9 @@ State ca2Step(NULL); //
 State ca3Step(NULL); // 
 State ca4Step(NULL); // 
 
+void nzCalibratingUpdate();
+State nzCalibrating(nzCalibratingUpdate); // 
+
 FiniteStateMachine screenMachine(startup);
 
 void stepperIdleEnter();
@@ -414,6 +417,24 @@ void displayCal4Step(bool saved)
 		screen.print(F("HIT ENTER TO FINISH "));
 }
 
+void displayNzCalibrate(bool finihsed)
+{
+	screen.blink_off();
+	screen.setCursor(0, 0);
+	screen.print(F("  SERVO CALIBRATION "));
+
+	screen.setCursor(0, 1);
+	screen.print(EMPTYROW);
+	screen.setCursor(0, 2);
+	if(finihsed)
+		screen.print(F("FINISHED CALIBRATING"));
+	else
+		screen.print(F("    CALIBRATING...  "));
+	screen.setCursor(0, 3);
+	screen.print(EMPTYROW);
+}
+
+
 void displayAbsoluteMode(bool init, uint8_t status)
 {
 	screen.blink_off();
@@ -633,15 +654,15 @@ void displayNudgeMode()
 	screen.print(F("MODE:NUDGE ADJUST   "));
 	screen.setCursor(0, 1);
 	if (unit == METRIC)
-		screen.print(F("#1 -0.1MM #3 +0.1MM "));
+		screen.print(F("#1 +0.1MM #3 -0.1MM "));
 	else
-		screen.print(F("#1 -1/32IN#3 +1/32IN"));
+		screen.print(F("#1 +1/32IN#3 -1/32IN"));
 
 	screen.setCursor(0, 2);
 	if (unit == METRIC)
-		screen.print(F("#4 -1MM   #6 +1MM   "));
+		screen.print(F("#4 +1MM   #6 -1MM   "));
 	else
-		screen.print(F("#4 -1/16IN#6 +1/16IN"));
+		screen.print(F("#4 +1/16IN#6 -1/16IN"));
 
 	screen.setCursor(0, 3);
 
@@ -1278,9 +1299,18 @@ void keypadEvent(KeypadEvent key) {
 
 				case '1':
 				{
-					double specifiedValue = -0.1;
+					double specifiedValue = 0.1;
 					Serial.print(F("nudge mode entered specified value is "));
-					Serial.println(F("-0.1mm"));
+					if (unit == METRIC)
+					{
+						specifiedValue = 0.1F;
+						Serial.println(F("0.1mm"));
+					}
+					else
+					{
+						specifiedValue = (double)25.4 / (double)32;
+						Serial.println(F("1/32inch"));
+					}
 					double value = absPos;
 					value += specifiedValue;
 					if (value >= 0.0F && value <= STROKE)
@@ -1294,9 +1324,18 @@ void keypadEvent(KeypadEvent key) {
 				break;
 				case '4':
 				{
-					double specifiedValue = -1.0;
+					double specifiedValue = 1.0;
 					Serial.print(F("nudge mode entered specified value is "));
-					Serial.println(F("-1.0mm"));
+					if (unit == METRIC)
+					{
+						specifiedValue = 1.0F;
+						Serial.println(F("1.0mm"));
+					}
+					else
+					{
+						specifiedValue = (double)25.4 / (double)16;
+						Serial.println(F("1/16inch"));
+					}
 					double value = absPos;
 					value += specifiedValue;
 					if (value >= 0.0F && value <= STROKE)
@@ -1312,16 +1351,16 @@ void keypadEvent(KeypadEvent key) {
 				case '3':
 				{
 					Serial.print(F("nudge mode entered specified value is "));
-					double specifiedValue = 0.1;
+					double specifiedValue = -0.1;
 					if (unit == METRIC)
 					{
-						specifiedValue = (double)25.4 / (double)32;
-						Serial.println(F("+0.1mm"));
+						specifiedValue = -0.1;
+						Serial.println(F("-0.1mm"));
 					}
 					else
 					{
-						specifiedValue = (double)25.4 / (double)32;
-						Serial.println(F("+1/32inch"));
+						specifiedValue = (double)-25.4 / (double)32;
+						Serial.println(F("-1/32inch"));
 					}
 					double value = absPos;
 					value += specifiedValue;
@@ -1337,9 +1376,19 @@ void keypadEvent(KeypadEvent key) {
 
 				case '6':
 				{
-					double specifiedValue = 1.0;
+					double specifiedValue = -1.0;
 					Serial.print(F("nudge mode entered specified value is "));
-					Serial.println(F("+1.0mm"));
+					if (unit == METRIC)
+					{
+						specifiedValue = -1.0;
+						Serial.println(F("-1.0mm"));
+					}
+					else
+					{
+						specifiedValue = (double)-25.4 / (double)16;
+						Serial.println(F("-1/16inch"));
+					}
+
 					double value = absPos;
 					value += specifiedValue;
 					if (value >= 0.0F && value <= STROKE)
@@ -1377,6 +1426,8 @@ void keypadEvent(KeypadEvent key) {
 			{
 				Serial.println(F("calibrating command has issued"));
 				stepper.calibrate();
+				screenMachine.transitionTo(nzCalibrating);
+				displayNzCalibrate(false);
 			}
 			else if ((char)key == 'B')
 			{
@@ -1654,3 +1705,20 @@ void calRevoUpdate()
 	}
 }
 
+void nzCalibratingUpdate()
+{
+	if (screenMachine.timeInCurrentState() > 1000)
+	{
+		screenMachine.resetTime();
+		double temp;
+		if (stepper.readPos(temp))
+		{
+			displayNzCalibrate(true);
+			delay(1000);
+			syncRelPos();
+			screenMachine.transitionTo(startup);
+		}
+		else
+			Serial.println(F("could not get response"));
+	}
+}
